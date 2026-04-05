@@ -1,31 +1,14 @@
 import argparse
+import os
+import json
+from datetime import datetime
 from torch_geometric.datasets import QM9
 from torch_geometric.loader import DataLoader
 import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+import numpy as np
 from model import GNNModel
-
-def load_data(raw=False) -> DataLoader:
-    print("Loading QM9 dataset for molecules...")
-    # Load the QM9 dataset
-    # The dataset will be automatically downloaded to './data/QM9' on first run
-    dataset = QM9(root='./data/QM9')
-    
-    print(f"Dataset loaded successfully!")
-    print(f"Number of molecules: {len(dataset)}")
-    print(f"Number of features per molecule: {dataset.num_features}")
-    print(f"Number of classes: {dataset.num_classes}")
-    
-    # Display information about the first molecule
-    if len(dataset) > 0:
-        data = dataset[0]
-        show_data_info(data)
-    
-    # Create a DataLoader for batching
-    batch_size = 32
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    print(f"\nCreated DataLoader with batch size: {batch_size}")
-    print("QM9 dataset import completed successfully!")
-    return loader
 
 def show_data_info(data):
     # 1. SEE NODE FEATURES (Atom properties)
@@ -105,34 +88,234 @@ def show_data_info(data):
                     else:
                         print(f"  {attr_name}: {attr_value}")
 
-def main():
-    # if argument --raw is passed, use raw data
-    parser = argparse.ArgumentParser(description="GNN for Molecular Property Prediction")
-    parser.add_argument('--raw', action='store_true', help="Show raw data information and exit")
-    args = parser.parse_args()
+def create_train_test_split(dataset, test_size=0.2, random_state=42):
+    """Split dataset into train and test sets"""
+    indices = list(range(len(dataset)))
+    train_idx, test_idx = train_test_split(indices, test_size=test_size, random_state=random_state)
+    return train_idx, test_idx
 
-    data_loader = load_data(raw=args.raw)
+def load_data(test_size=0.2):
+    """Load QM9 dataset and create train/test split"""
+    print("Loading QM9 dataset for molecules...")
+    dataset = QM9(root='./data/QM9')
+    
+    print(f"Dataset loaded successfully!")
+    print(f"Number of molecules: {len(dataset)}")
+    print(f"Number of features per molecule: {dataset.num_features}")
+    
+    # Create train/test split
+    train_idx, test_idx = create_train_test_split(dataset, test_size=test_size)
+    
+    # Create subsets
+    train_dataset = dataset[train_idx]
+    test_dataset = dataset[test_idx]
+    
+    print(f"\nDataset split:")
+    print(f"  Training samples: {len(train_idx)} ({len(train_idx)/len(dataset)*100:.1f}%)")
+    print(f"  Test samples: {len(test_idx)} ({len(test_idx)/len(dataset)*100:.1f}%)")
+    
+    return train_dataset, test_dataset
 
-    # import the model
-    model = GNNModel(in_channels=11, hidden_channels=64, out_channels=1)
-    print("\nGNN Model initialized successfully!")
-    print(model)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    criterion = torch.nn.MSELoss()
+def train_model(model, train_loader, criterion, optimizer, device, epochs=50):
+    """Train the model"""
     model.train()
-    for data in data_loader:
-        optimizer.zero_grad()
-        # Predict
-        out = model(data.x, data.edge_index, data.batch)
-        # QM9 has 19 targets. Let's predict the first one (index 0)
-        loss = criterion(out, data.y[:, 0].view(-1, 1))
-        # Backprop
-        loss.backward()
-        optimizer.step()
-    return loss.item()
+    train_losses = []
+    
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            # Forward pass
+            out = model(batch.x, batch.edge_index, batch.batch)
+            
+            # Use first target property (dipole moment)
+            target = batch.y[:, 0].view(-1, 1)
+            loss = criterion(out, target)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+    
+    return train_losses
 
+def evaluate_model(model, test_loader, criterion, device):
+    """Evaluate model on test set"""
+    model.eval()
+    test_loss = 0
+    predictions = []
+    targets = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(device)
+            out = model(batch.x, batch.edge_index, batch.batch)
+            target = batch.y[:, 0].view(-1, 1)
+            loss = criterion(out, target)
+            
+            test_loss += loss.item()
+            predictions.extend(out.cpu().numpy().flatten())
+            targets.extend(target.cpu().numpy().flatten())
+    
+    avg_test_loss = test_loss / len(test_loader)
+    
+    # Calculate metrics
+    predictions = np.array(predictions)
+    targets = np.array(targets)
+    mae = np.mean(np.abs(predictions - targets))
+    rmse = np.sqrt(np.mean((predictions - targets) ** 2))
+    
+    return avg_test_loss, mae, rmse, predictions[:10], targets[:10]  # Return first 10 for display
 
+def generate_report(train_losses, test_loss, mae, rmse, model_info, config):
+    """Generate report files in reports/ folder"""
+    # Create reports directory if it doesn't exist
+    os.makedirs('reports', exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 1. Save training metrics
+    metrics = {
+        "timestamp": timestamp,
+        "training_losses": train_losses,
+        "final_training_loss": train_losses[-1] if train_losses else None,
+        "test_loss": float(test_loss),
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "model_info": model_info,
+        "config": config
+    }
+    
+    metrics_file = f"reports/metrics_{timestamp}.json"
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    # 2. Save summary report
+    summary_file = f"reports/summary_{timestamp}.txt"
+    with open(summary_file, 'w') as f:
+        f.write(f"GNN Model Training Report\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 50 + "\n\n")
+        
+        f.write("MODEL CONFIGURATION:\n")
+        f.write(f"  Input channels: {config['in_channels']}\n")
+        f.write(f"  Hidden channels: {config['hidden_channels']}\n")
+        f.write(f"  Output channels: {config['out_channels']}\n")
+        f.write(f"  Learning rate: {config['learning_rate']}\n")
+        f.write(f"  Batch size: {config['batch_size']}\n")
+        f.write(f"  Epochs: {config['epochs']}\n")
+        f.write(f"  Test split: {config['test_size']}\n\n")
+        
+        f.write("TRAINING RESULTS:\n")
+        if train_losses:
+            f.write(f"  Final training loss: {train_losses[-1]:.6f}\n")
+        else:
+            f.write(f"  Final training loss: N/A (no training performed)\n")
+        f.write(f"  Test loss: {test_loss:.6f}\n")
+        f.write(f"  Mean Absolute Error (MAE): {mae:.6f}\n")
+        f.write(f"  Root Mean Square Error (RMSE): {rmse:.6f}\n\n")
+        
+        f.write("MODEL ARCHITECTURE:\n")
+        f.write(model_info + "\n")
+    
+    print(f"\nReports generated:")
+    print(f"  - {metrics_file}")
+    print(f"  - {summary_file}")
+    
+    return metrics_file, summary_file
+
+def main():
+    parser = argparse.ArgumentParser(description="GNN for Molecular Property Prediction")
+    parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs")
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size")
+    parser.add_argument('--lr', type=float, default=0.01, help="Learning rate")
+    parser.add_argument('--test_size', type=float, default=0.2, help="Test set size ratio")
+    parser.add_argument('--no_train', action='store_true', help="Skip training, only evaluate")
+    args = parser.parse_args()
+    
+    # Configuration
+    config = {
+        'in_channels': 11,  # QM9 has 11 node features
+        'hidden_channels': 64,
+        'out_channels': 1,  # Predicting one property (dipole moment)
+        'learning_rate': args.lr,
+        'batch_size': args.batch_size,
+        'epochs': args.epochs,
+        'test_size': args.test_size
+    }
+    
+    print("=" * 60)
+    print("GNN Model Training Pipeline")
+    print("=" * 60)
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load data with train/test split
+    train_dataset, test_dataset = load_data(test_size=args.test_size)
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    # Initialize model
+    model = GNNModel(
+        in_channels=config['in_channels'],
+        hidden_channels=config['hidden_channels'],
+        out_channels=config['out_channels']
+    ).to(device)
+    
+    model_info = str(model)
+    print(f"\nModel initialized:")
+    print(model)
+    
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Train model
+    if not args.no_train:
+        print(f"\nTraining model for {args.epochs} epochs...")
+        train_losses = train_model(model, train_loader, criterion, optimizer, device, args.epochs)
+        print(f"Training completed!")
+    else:
+        print("\nSkipping training (--no_train flag set)")
+        train_losses = []
+    
+    # Evaluate model
+    print("\nEvaluating model on test set...")
+    test_loss, mae, rmse, sample_preds, sample_targets = evaluate_model(
+        model, test_loader, criterion, device
+    )
+    
+    print(f"\nEvaluation Results:")
+    print(f"  Test Loss (MSE): {test_loss:.6f}")
+    print(f"  Mean Absolute Error (MAE): {mae:.6f}")
+    print(f"  Root Mean Square Error (RMSE): {rmse:.6f}")
+    
+    print(f"\nSample predictions vs targets (first 10):")
+    for i, (pred, target) in enumerate(zip(sample_preds, sample_targets)):
+        print(f"  Sample {i}: Pred={pred:.4f}, Target={target:.4f}, Diff={abs(pred-target):.4f}")
+    
+    # Generate reports
+    print("\nGenerating reports...")
+    metrics_file, summary_file = generate_report(
+        train_losses, test_loss, mae, rmse, model_info, config
+    )
+    
+    print("\n" + "=" * 60)
+    print("Pipeline completed successfully!")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
