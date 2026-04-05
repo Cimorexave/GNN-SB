@@ -6,3 +6,7 @@
 
 # Ignore reports
 /reports
+
+# Ignore Cache files
+__pycache__
+*.pyc
